@@ -10,19 +10,27 @@ internal static class GenerationPrompts
         {
           "version": "1.0",
           "operations": [
-            { "type": "replace", "path": "relative/file/path", "oldText": "...", "newText": "..." }
+            { "type": "insert_after", "path": "relative/file/path", "oldText": "...unique anchor...", "newText": "...content to insert..." }
           ]
         }
 
         Rules:
-        - Every operation "type" must be "replace". There is no insert or create.
+        - Operation "type" must be "replace", "insert_before", or "insert_after".
+          There is no file-create operation.
         - "path" is relative to the project folder (for example "MainWindow.xaml").
         - "oldText" MUST be a snippet copied VERBATIM from the CURRENT PROJECT FILES
           shown to you, and it MUST occur exactly once in that file. It must NEVER be
-          empty. Keep it as small as possible while staying unique — a single opening
-          tag such as "<Grid>" is a good choice.
-        - "newText" is the full replacement for that exact snippet: repeat the snippet
-          and add your changes around or inside it.
+          empty. Keep it as small as possible while staying unique.
+        - For "replace", "newText" is the complete replacement for oldText.
+        - For "insert_before" and "insert_after", oldText is a stable unique anchor
+          that remains unchanged and newText is only the content to insert. Do not
+          repeat the anchor in newText.
+        - Prefer insert_before or insert_after when adding a sibling control, method,
+          rule, or other localized content. Use replace only when changing existing
+          text or when oldText contains the complete balanced structure being replaced.
+        - In XAML, never introduce or remove a parent closing tag such as </Grid> or
+          </StackPanel> unless oldText contains that same complete parent boundary.
+          The complete resulting XAML document must remain well formed.
         - Never invent files, paths, or text that is not shown to you.
         - If the change is impossible from the given files, return
           {"version":"1.0","operations":[]}.
@@ -51,18 +59,16 @@ internal static class GenerationPrompts
         - When resetting a WPF window, use a conventional Visual Studio-style WPF
           desktop layout rather than an edge-to-edge or full-window design.
 
-        Example. To add controls inside an empty grid, when the current file shows:
-            <Grid>
-            </Grid>
+        Example. To add a sibling after a uniquely named existing button:
+            <Button x:Name="SaveButton" Content="Save" />
         a correct operation is:
             {
-              "type": "replace",
+              "type": "insert_after",
               "path": "MainWindow.xaml",
-              "oldText": "<Grid>",
-              "newText": "<Grid>\n        <Button Content=\"Hi\" />"
+              "oldText": "<Button x:Name=\"SaveButton\" Content=\"Save\" />",
+              "newText": "\n        <Button Content=\"Cancel\" />"
             }
-        (oldText is the existing "<Grid>" tag copied exactly; newText repeats it and
-        adds the new content. oldText is never blank.)
+        (oldText remains unchanged; newText contains only the localized insertion.)
         """;
 
     public static string BuildUser(string request, string projectContext) =>

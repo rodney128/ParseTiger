@@ -8,7 +8,7 @@ public static class PackageValidationReport
 {
     public static string ParseFailure(string detail) =>
         $"✗ JSON parse{Environment.NewLine}  {detail}{Environment.NewLine}" +
-        "• Schema, paths, exact matches, and safety checks were not run.";
+        "• Schema, paths, exact anchors, and safety checks were not run.";
 
     public static string Build(
         Package package,
@@ -29,19 +29,27 @@ public static class PackageValidationReport
         {
             text.AppendLine("  • " + error);
         }
+        foreach (string warning in validation.Warnings)
+        {
+            text.AppendLine("  ⚠ " + warning);
+        }
 
         if (preview is not null)
         {
             foreach (OperationPreview operation in preview.Operations)
             {
                 text.AppendLine(operation.Applicable
-                    ? $"✓ Operation {operation.Number}: {operation.Path} has one exact match"
+                    ? $"✓ Operation {operation.Number}: {operation.Path} has one exact match for its anchor"
                     : $"✗ Operation {operation.Number}: {operation.Path} — {operation.Error}");
+                foreach (string warning in operation.Warnings)
+                {
+                    text.AppendLine($"  ⚠ {warning}");
+                }
             }
         }
         else
         {
-            text.AppendLine("• Exact current-file match check not run");
+            text.AppendLine("• Exact current-file anchor check not run");
         }
 
         return text.ToString().TrimEnd();

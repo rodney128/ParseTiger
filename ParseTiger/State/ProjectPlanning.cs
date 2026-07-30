@@ -167,7 +167,7 @@ public static class IntentSummaryFormatter
                $"Framework: {facts?.ProjectKind ?? "Unknown"} / " +
                $"{facts?.TargetFramework ?? "Unknown"}{Environment.NewLine}" +
                $"Context files: {contextFiles:N0}{Environment.NewLine}" +
-               "Constraints: replace-only package; project-relative paths; " +
+               "Constraints: localized replace/insert package; project-relative paths; " +
                "generated output and unrelated configuration excluded.";
     }
 }

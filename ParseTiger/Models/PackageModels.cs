@@ -21,6 +21,7 @@ public sealed class ValidationResult
 {
     public bool IsValid { get; set; }
     public List<string> Errors { get; set; } = new();
+    public List<string> Warnings { get; set; } = new();
 }
 
 /// <summary>The outcome of executing a package.</summary>
@@ -43,6 +44,9 @@ public sealed class PackagePreview
     /// <summary>True only when every operation would apply cleanly.</summary>
     public bool CanApply =>
         Operations.Count > 0 && Operations.All(operation => operation.Applicable);
+
+    public bool HasWarnings =>
+        Operations.Any(operation => operation.Warnings.Count > 0);
 }
 
 /// <summary>The computed before/after for one operation.</summary>
@@ -58,7 +62,10 @@ public sealed class OperationPreview
     public int OldTextLength { get; set; }
     public int MatchCount { get; set; }
     public string NearbyExcerpt { get; set; } = string.Empty;
+    public List<string> Warnings { get; set; } = new();
 
     public string StatusText =>
-        Applicable ? "Will apply" : "Cannot apply: " + (Error ?? "unknown");
+        Applicable
+            ? Warnings.Count == 0 ? "Will apply" : "Will apply with warning"
+            : "Cannot apply: " + (Error ?? "unknown");
 }
