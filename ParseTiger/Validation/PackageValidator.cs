@@ -12,7 +12,12 @@ namespace ParseTiger.Validation;
 public sealed class PackageValidator
 {
     private static readonly HashSet<string> SupportedOperationTypes =
-        new(StringComparer.OrdinalIgnoreCase) { "replace" };
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "replace",
+            "insert_before",
+            "insert_after"
+        };
 
     public ValidationResult Validate(Package package)
     {
@@ -68,16 +73,16 @@ public sealed class PackageValidator
                 "not contain \"..\".");
         }
 
-        if (type.Equals("replace", StringComparison.OrdinalIgnoreCase))
+        if (SupportedOperationTypes.Contains(type))
         {
             if (string.IsNullOrEmpty(operation.OldText))
             {
-                result.Errors.Add($"{where}: replace requires oldText.");
+                result.Errors.Add($"{where}: {type} requires a non-empty oldText anchor.");
             }
 
             if (operation.NewText is null)
             {
-                result.Errors.Add($"{where}: replace requires newText.");
+                result.Errors.Add($"{where}: {type} requires newText.");
             }
         }
     }

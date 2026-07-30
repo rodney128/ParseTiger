@@ -36,6 +36,10 @@ public partial class MainWindow : Window
     private readonly Stopwatch _stopwatch = new();
     private readonly DispatcherTimer _timer;
     private readonly BaselineService _baselineService = new();
+    private readonly BaselineService _checkpointService = new(Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ParseTiger",
+        "Checkpoints"));
     private readonly ProjectStateService _projectState = new();
     private readonly ProjectDefaultTemplateService _defaultTemplateService = new();
     private readonly IProviderSettingsStore _providerSettings =
@@ -61,8 +65,11 @@ public partial class MainWindow : Window
     private FailedRunRetryContext? _lastFailedRun;
     private bool _retryRequested;
     private bool _isRetryRunning;
+    private bool _workflowActivityTerminalRecorded;
     private AiProjectFacts? _projectFacts;
     private string _lastBuildHealth = "Not run this session";
+    private string _healthBuildSolution = string.Empty;
+    private int _healthBuildVersion;
 
     public MainWindow()
     {
@@ -82,6 +89,11 @@ public partial class MainWindow : Window
 
     private async void Run_Click(object sender, RoutedEventArgs e)
     {
+        if (!EnsureSolutionSelected())
+        {
+            return;
+        }
+
         _retryRequested = false;
         await RunWorkflowAsync();
     }
@@ -120,8 +132,13 @@ public partial class MainWindow : Window
         bool mutationStarted = false;
         bool workflowSucceeded = false;
         bool preserveBuiltChanges = false;
+        SelfUpdatePlan? selfUpdatePlan = null;
         bool retrying = _retryRequested;
         FailedRunRetryContext? retryContext = retrying ? _lastFailedRun : null;
+        ResetWorkflowActivity();
+        BeginWorkflowActivity(
+            "Workflow",
+            retrying ? "Retrying the previous failed run." : "Generation run started.");
         BeginDiagnostics();
         if (retrying && retryContext is not null)
         {
@@ -171,6 +188,11 @@ public partial class MainWindow : Window
             // Resolve the target project (needed for grounding, applying, building).
             string solutionPath = SolutionPath.Text?.Trim() ?? string.Empty;
             _currentDiagnostics!.Run.SolutionPath = solutionPath;
+            BeginWorkflowActivity(
+                "Inspecting / loading solution",
+                string.IsNullOrWhiteSpace(solutionPath)
+                    ? "Resolving the selected solution and target project."
+                    : $"Resolving {Path.GetFileName(solutionPath)}.");
             _currentDiagnostics.Start(
                 "project",
                 "Resolving the selected solution and target project.");
@@ -216,6 +238,9 @@ public partial class MainWindow : Window
             _currentDiagnostics.Succeed(
                 "project",
                 $"Resolved {target.Name} ({target.Kind}) at {target.Directory}.");
+            CompleteWorkflowActivity(
+                "Inspecting / loading solution",
+                $"Resolved {target.Name} ({target.Kind}).");
             AppendOutput(
                 $"Target: {target.Name} ({target.Kind}) at {target.Directory}." +
                 Environment.NewLine);
@@ -421,6 +446,9 @@ public partial class MainWindow : Window
                         : "pending; this request will verify it with the provider.") +
                     Environment.NewLine);
                 SetStage($"Creating context for {GetProviderName(selectedProvider)}...");
+                BeginWorkflowActivity(
+                    "Collecting project context",
+                    "Collecting current project files for grounding.");
                 _currentDiagnostics.Start(
                     "context",
                     "Collecting current project files for grounding.");
@@ -447,6 +475,9 @@ public partial class MainWindow : Window
                         "context",
                         $"Collected {currentContext.ContentFileCount:N0} files " +
                         $"({currentContext.Text.Length:N0} characters).");
+                    CompleteWorkflowActivity(
+                        "Collecting project context",
+                        $"Collected {currentContext.ContentFileCount:N0} files.");
                     AppendOutput(
                         $"Context creation: complete; " +
                         $"{currentContext.ContentFileCount:N0} files, " +
@@ -461,6 +492,10 @@ public partial class MainWindow : Window
                     _currentDiagnostics.Start(
                         "provider-request",
                         $"Sending request with {generator.GetType().Name}; model {model}.");
+                    string providerName = GetProviderName(selectedProvider);
+                    BeginWorkflowActivity(
+                        $"Sending request to {providerName}",
+                        $"Using model {model}.");
                     json = await generator.GenerateAsync(
                         request,
                         currentContext.Text,
@@ -469,12 +504,21 @@ public partial class MainWindow : Window
                     _currentDiagnostics.Succeed(
                         "provider-request",
                         $"Provider completed the request using model {model}.");
+                    CompleteWorkflowActivity(
+                        $"Sending request to {providerName}",
+                        "Provider request completed.");
+                    BeginWorkflowActivity(
+                        $"Receiving response from {providerName}",
+                        "Reading the returned ParseTiger package.");
                     _currentDiagnostics.Start(
                         "provider-response",
                         "Reading the returned package.");
                     _currentDiagnostics.Succeed(
                         "provider-response",
                         $"Received {json.Length:N0} package characters.");
+                    CompleteWorkflowActivity(
+                        $"Receiving response from {providerName}",
+                        $"Received {json.Length:N0} characters.");
                     RefreshProviderConfigurationStatus();
                 }
                 catch (ProviderRequestException exception)
@@ -548,6 +592,9 @@ public partial class MainWindow : Window
 
             // 2. Validate (deterministic)
             SetStage("Validating...");
+            BeginWorkflowActivity(
+                "Validating ParseTiger package",
+                "Parsing JSON and checking package rules and replacements.");
             _currentDiagnostics.Start("parse", "Parsing package JSON.");
             AppendOutput(
                 $"{Environment.NewLine}▶ Parse: reading package JSON." +
@@ -612,9 +659,9 @@ public partial class MainWindow : Window
 
             _currentDiagnostics.Start(
                 "preflight",
-                "Checking every replace operation against current file contents.");
+                "Checking every operation, unique anchor, and resulting file structure.");
             AppendOutput(
-                "▶ Replace preflight: checking exact oldText matches." +
+                "▶ Safety preflight: checking anchors and resulting structure." +
                 Environment.NewLine);
             PackagePreview preflight =
                 new PackageExecutor().Preview(package, runContext);
@@ -628,14 +675,43 @@ public partial class MainWindow : Window
                     "preflight",
                     DiagnosticFailureKind.Validation,
                     detail);
-                Fail("Replace preflight failed", detail);
+                Fail("Safety preflight failed", detail);
                 return;
             }
             _currentDiagnostics.Succeed(
                 "preflight",
-                $"All {preflight.Operations.Count:N0} operations have one unique match.");
+                $"All {preflight.Operations.Count:N0} operations passed anchor and structure checks.");
+            CompleteWorkflowActivity(
+                "Validating ParseTiger package",
+                $"{preflight.Operations.Count:N0} operation(s) passed.");
+
+            if (preflight.HasWarnings)
+            {
+                string warningDetail = string.Join(
+                    Environment.NewLine,
+                    preflight.Operations
+                        .SelectMany(operation => operation.Warnings)
+                        .Distinct(StringComparer.Ordinal));
+                MessageBoxResult proceed = MessageBox.Show(
+                    "ParseTiger found a change whose scope is unusually large " +
+                    "for its anchor:" + Environment.NewLine + Environment.NewLine +
+                    warningDetail + Environment.NewLine + Environment.NewLine +
+                    "Review the validation report. Apply this package anyway?",
+                    "Large Change Scope Warning",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning,
+                    MessageBoxResult.No);
+                if (proceed != MessageBoxResult.Yes)
+                {
+                    Fail(
+                        "Apply cancelled",
+                        "The package was not applied because its scope warning " +
+                        "was not confirmed.");
+                    return;
+                }
+            }
             AppendOutput(
-                $"✓ Replace preflight succeeded " +
+                $"✓ Safety preflight succeeded " +
                 $"({preflight.Operations.Count:N0} operations)." +
                 Environment.NewLine);
 
@@ -700,6 +776,7 @@ public partial class MainWindow : Window
                 _lastBackup = runContext.ToBackup();
                 mutationStarted = true;
             }
+            _checkpointService.Save(target.Directory, target.Kind);
             _currentDiagnostics.Succeed(
                 "backup",
                 $"Captured {_lastBackup!.Files.Count:N0} files.");
@@ -715,6 +792,9 @@ public partial class MainWindow : Window
                 $"Safety checkpoint captured before apply: " +
                 $"{_lastBackup.Files.Count:N0} files.");
             SetStage("Applying...");
+            BeginWorkflowActivity(
+                "Applying changes",
+                $"Applying {package.Operations.Count:N0} operation(s).");
             UpdateUndo();
             _currentDiagnostics.Start(
                 "apply",
@@ -749,6 +829,9 @@ public partial class MainWindow : Window
             }
 
             _currentDiagnostics.Succeed("apply", apply.Message ?? "Apply succeeded.");
+            CompleteWorkflowActivity(
+                "Applying changes",
+                apply.Message ?? "Changes applied.");
             _currentDiagnostics.Run.ProjectChangesPersisted = true;
             _currentDiagnostics.Run.ProjectChangesDetail =
                 $"{_currentDiagnostics.Run.ModifiedFiles.Count:N0} file(s) were " +
@@ -764,12 +847,27 @@ public partial class MainWindow : Window
 
             // 4. Build the solution — auto-roll-back if it fails.
             SetStage("Building...");
+            BeginWorkflowActivity(
+                "Building",
+                $"Building {Path.GetFileName(solutionPath)}.");
             _currentDiagnostics.Start(
                 "build",
                 $"Building {Path.GetFileName(solutionPath)}.");
             AppendOutput($"{Environment.NewLine}▶ Building {Path.GetFileName(solutionPath)}…{Environment.NewLine}");
+            string? selfBuildStagingRoot = selfChanges.IsSelfModification
+                ? SelfUpdateCoordinator.CreateStagingDirectory()
+                : null;
+            if (selfBuildStagingRoot is not null)
+            {
+                AppendOutput(
+                    $"Self-update: building outside the running output directory at " +
+                    $"{selfBuildStagingRoot}.{Environment.NewLine}");
+            }
             BuildResult build = await Task.Run(() =>
-                new SolutionBuilder().Build(solutionPath, progress));
+                new SolutionBuilder().Build(
+                    solutionPath,
+                    progress,
+                    selfBuildStagingRoot));
             if (!build.Succeeded)
             {
                 _lastBuildHealth = "Failed — see Output and Diagnostics";
@@ -782,7 +880,25 @@ public partial class MainWindow : Window
                     "Build failed, so your files were restored to their previous state.");
                 return;
             }
-            _currentDiagnostics.Succeed("build", "Build completed successfully.");
+            if (selfBuildStagingRoot is not null)
+            {
+                string currentExecutable =
+                    Environment.ProcessPath ??
+                    throw new InvalidOperationException(
+                        "ParseTiger could not resolve its running executable.");
+                selfUpdatePlan = SelfUpdateCoordinator.Prepare(
+                    selfBuildStagingRoot,
+                    target.Name,
+                    currentExecutable,
+                    Environment.ProcessId);
+            }
+            _currentDiagnostics.Succeed(
+                "build",
+                selfUpdatePlan is null
+                    ? "Build completed successfully."
+                    : "Staged self-build completed successfully outside the locked " +
+                      "running output directory.");
+            CompleteWorkflowActivity("Building", "Build succeeded.");
             _lastBuildHealth = "Succeeded";
             RefreshPlanningPanels();
             preserveBuiltChanges = true;
@@ -799,11 +915,21 @@ public partial class MainWindow : Window
 
             // 5. Launch
             SetStage("Running...");
+            BeginWorkflowActivity("Running", $"Launching {target.Name}.");
             _currentDiagnostics.Start("launch", $"Launching {target.Name}.");
             AppendOutput($"Run: launching {target.Name}.{Environment.NewLine}");
+            bool restartScheduled = false;
             try
             {
-                new AppLauncher().Launch(target.Directory, target.Name);
+                if (selfUpdatePlan is null)
+                {
+                    new AppLauncher().Launch(target.Directory, target.Name);
+                }
+                else
+                {
+                    new SelfUpdateCoordinator().Schedule(selfUpdatePlan);
+                    restartScheduled = true;
+                }
             }
             catch (Exception exception)
             {
@@ -820,6 +946,7 @@ public partial class MainWindow : Window
                 _currentDiagnostics.Skip(
                     "rollback",
                     "No rollback: Apply and Build succeeded; only Launch failed.");
+                FailWorkflowRun("Running", launchFailure);
                 SetStage(
                     "Launch failed — project changes kept",
                     "The project files were successfully modified and built. " +
@@ -838,8 +965,15 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _currentDiagnostics.Succeed("launch", $"Launched {target.Name}.");
-            AppendOutput($"✓ Launch succeeded: {target.Name}." + Environment.NewLine);
+            string launchSuccess = restartScheduled
+                ? "Verified self-update scheduled; ParseTiger will close, install, and restart."
+                : $"Launched {target.Name}.";
+            _currentDiagnostics.Succeed("launch", launchSuccess);
+            CompleteWorkflowActivity("Running", launchSuccess);
+            AppendOutput(
+                restartScheduled
+                    ? $"✓ Self-update restart handoff succeeded.{Environment.NewLine}"
+                    : $"✓ Launch succeeded: {target.Name}.{Environment.NewLine}");
             ProjectStateSnapshot runningState = _projectState.RefreshCurrent(
                 identity,
                 "successful run");
@@ -854,9 +988,26 @@ public partial class MainWindow : Window
                 "file(s) changed.");
             RefreshSessionViews();
             SetStage(
-                "Completed successfully",
-                $"Generated, validated, applied, built, and launched {target.Name}.");
-            AppendOutput($"{Environment.NewLine}✓ Launched {target.Name}.{Environment.NewLine}");
+                restartScheduled
+                    ? "Self-update verified — restarting ParseTiger"
+                    : "Completed successfully",
+                restartScheduled
+                    ? "The updated build passed. ParseTiger will close, install the " +
+                      "staged files, and restart from its normal output directory."
+                    : $"Generated, validated, applied, built, and launched {target.Name}.");
+            CompleteWorkflowRun($"Completed successfully for {target.Name}.");
+            AppendOutput(
+                restartScheduled
+                    ? $"{Environment.NewLine}✓ Closing for verified self-update." +
+                      Environment.NewLine
+                    : $"{Environment.NewLine}✓ Launched {target.Name}." +
+                      Environment.NewLine);
+            if (restartScheduled)
+            {
+                _ = Dispatcher.BeginInvoke(
+                    () => Application.Current.Shutdown(),
+                    DispatcherPriority.ApplicationIdle);
+            }
         }
         catch (Exception exception)
         {
@@ -902,6 +1053,11 @@ public partial class MainWindow : Window
 
     private void CopyAiRequest_Click(object sender, RoutedEventArgs e)
     {
+        if (!EnsureSolutionSelected())
+        {
+            return;
+        }
+
         string requestedChange;
         try
         {
@@ -999,7 +1155,8 @@ public partial class MainWindow : Window
     {
         if (ProviderSelector is null ||
             DirectGenerationPanel is null ||
-            ManualCopyPanel is null)
+            ManualCopyPanel is null ||
+            ManualModeGuidance is null)
         {
             return;
         }
@@ -1007,6 +1164,8 @@ public partial class MainWindow : Window
         GeneratorOption selected = SelectedProvider;
         bool direct = selected.Provider != GeneratorProvider.PasteJson;
         DirectGenerationPanel.Visibility = Visibility.Visible;
+        ManualModeGuidance.Visibility =
+            direct ? Visibility.Collapsed : Visibility.Visible;
         ManualCopyPanel.Visibility = direct ? Visibility.Collapsed : Visibility.Visible;
         ReturnedPackagePlaceholder.Text = direct
             ? "The generated ParseTiger package will appear here"
@@ -1142,6 +1301,7 @@ public partial class MainWindow : Window
         }
 
         UpdateActionAvailability();
+        RefreshPackageValidationPreview();
     }
 
     private void DirectRequestBox_TextChanged(
@@ -1251,6 +1411,13 @@ public partial class MainWindow : Window
                 SourceExtensions,
                 DirectRequestBox.Text);
             _projectMemory.SetRecentFiles(planningFiles);
+            if ((_lastBackup is null || !_lastBackup.HasFiles) &&
+                _checkpointService.Exists(context.Target.Directory))
+            {
+                _lastBackup = _checkpointService.Load(context.Target.Directory);
+                _sessionLog.Add(
+                    "Loaded the durable pre-apply recovery checkpoint for Undo.");
+            }
             if (previousStateId != context.Snapshot.Id)
             {
                 AppendOutput(
@@ -1267,6 +1434,7 @@ public partial class MainWindow : Window
             UpdateActionAvailability();
             UpdateReadyStatus();
             RefreshPlanningPanels();
+            BeginProjectHealthBuild(context);
             return;
         }
 
@@ -1395,6 +1563,11 @@ public partial class MainWindow : Window
         try
         {
             BackupService.Restore(_lastBackup);
+            if (TryResolveSelectedProject(out _, out ProjectInfo? undoTarget) &&
+                undoTarget is not null)
+            {
+                _checkpointService.Delete(undoTarget.Directory);
+            }
             RefreshCurrentStateAfterLocalChange("Undo");
             AppendOutput($"{Environment.NewLine}↩ Reverted the last change.{Environment.NewLine}");
             StatusText.Text = "Reverted the last change. Run again to rebuild.";
@@ -1564,6 +1737,7 @@ public partial class MainWindow : Window
 
         try
         {
+            _checkpointService.Save(target.Directory, target.Kind);
             resetAction();
             bool projectBaselineReset = successMessage.Contains(
                 "saved project baseline",
@@ -1622,11 +1796,7 @@ public partial class MainWindow : Window
         string solutionPath = SolutionPath.Text?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(solutionPath))
         {
-            MessageBox.Show(
-                "Select a target solution first.",
-                "No Target Solution",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            ShowSolutionSelectionReminder();
             return false;
         }
 
@@ -1653,6 +1823,29 @@ public partial class MainWindow : Window
         }
     }
 
+    private bool EnsureSolutionSelected()
+    {
+        if (!SolutionSelectionRequirement.IsMissing(SolutionPath.Text))
+        {
+            return true;
+        }
+
+        ShowSolutionSelectionReminder();
+        return false;
+    }
+
+    private void ShowSolutionSelectionReminder()
+    {
+        StatusText.Text = "Select a target solution first";
+        StatusDetailText.Text = SolutionSelectionRequirement.Reminder;
+        SolutionPath.Focus();
+        MessageBox.Show(
+            SolutionSelectionRequirement.Reminder,
+            "Target Solution Required",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
     private void SetResetControlsEnabled(bool enabled)
     {
         SetBaselineButton.IsEnabled = enabled;
@@ -1665,10 +1858,7 @@ public partial class MainWindow : Window
         DirectRequestBox.IsEnabled = enabled;
         ReturnedPackageBox.IsEnabled = enabled;
         ClearTextButton.IsEnabled = enabled;
-        CopyAiRequestButton.IsEnabled =
-            enabled &&
-            _aiRequestContext is not null &&
-            !string.IsNullOrWhiteSpace(DirectRequestBox.Text);
+        CopyAiRequestButton.IsEnabled = enabled;
         if (!enabled)
         {
             RunButton.IsEnabled = false;
@@ -2039,6 +2229,10 @@ public partial class MainWindow : Window
 
     private void RollBack(string stage, string detail)
     {
+        FailWorkflowRun(stage, detail);
+        BeginWorkflowActivity(
+            "Recovery",
+            "Restoring files from the pre-apply snapshot.");
         _currentDiagnostics?.Start(
             "rollback",
             "Restoring files from the pre-apply byte snapshot.");
@@ -2052,6 +2246,9 @@ public partial class MainWindow : Window
                 _currentDiagnostics?.Succeed(
                     "rollback",
                     $"Restored {_lastBackup.Files.Count:N0} files exactly.");
+                CompleteWorkflowActivity(
+                    "Recovery",
+                    $"Restored {_lastBackup.Files.Count:N0} file(s).");
                 if (_currentDiagnostics is not null)
                 {
                     _currentDiagnostics.Run.ProjectChangesPersisted = false;
@@ -2063,6 +2260,7 @@ public partial class MainWindow : Window
             catch (Exception exception)
             {
                 detail += Environment.NewLine + "(Restore also failed: " + exception.Message + ")";
+                FailWorkflowActivity("Recovery", exception.Message);
                 _currentDiagnostics?.Fail(
                     "rollback",
                     DiagnosticFailureKind.Rollback,
@@ -2071,6 +2269,11 @@ public partial class MainWindow : Window
 
             if (restored)
             {
+                string? projectRoot = _projectState.CurrentState?.Identity.ProjectRoot;
+                if (!string.IsNullOrWhiteSpace(projectRoot))
+                {
+                    _checkpointService.Delete(projectRoot);
+                }
                 _lastBackup = null;
             }
             else
@@ -2172,6 +2375,92 @@ public partial class MainWindow : Window
         RefreshDiagnosticsView();
     }
 
+    private void ResetWorkflowActivity()
+    {
+        WorkflowActivityStream.Clear();
+        _workflowActivityTerminalRecorded = false;
+    }
+
+    private void BeginWorkflowActivity(string stage, string? detail = null) =>
+        AppendWorkflowActivity(stage, "Started", detail);
+
+    private void CompleteWorkflowActivity(string stage, string? detail = null) =>
+        AppendWorkflowActivity(stage, "Completed", detail);
+
+    private void FailWorkflowActivity(string stage, string detail) =>
+        AppendWorkflowActivity(stage, "FAILED", detail);
+
+    private void CompleteWorkflowRun(string detail)
+    {
+        if (_workflowActivityTerminalRecorded)
+        {
+            return;
+        }
+
+        _workflowActivityTerminalRecorded = true;
+        CompleteWorkflowActivity("Workflow", detail);
+    }
+
+    private void FailWorkflowRun(string failedStage, string detail)
+    {
+        FailWorkflowActivity(failedStage, detail);
+        if (_workflowActivityTerminalRecorded)
+        {
+            return;
+        }
+
+        _workflowActivityTerminalRecorded = true;
+        FailWorkflowActivity(
+            "Workflow",
+            $"Stopped at {failedStage}. {detail}");
+    }
+
+    private void AppendWorkflowActivity(
+        string stage,
+        string state,
+        string? detail = null)
+    {
+        string conciseDetail = (detail ?? string.Empty)
+            .Replace("\r\n", " ", StringComparison.Ordinal)
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        if (conciseDetail.Length > 360)
+        {
+            conciseDetail = conciseDetail[..357] + "...";
+        }
+
+        string line = $"[{DateTime.Now:HH:mm:ss}] {stage} - {state}";
+        if (conciseDetail.Length > 0)
+        {
+            line += $": {conciseDetail}";
+        }
+
+        WorkflowActivityStream.AppendText(line + Environment.NewLine);
+        WorkflowActivityStream.ScrollToEnd();
+    }
+
+    private void WorkspaceSplitter_DragDelta(
+        object sender,
+        System.Windows.Controls.Primitives.DragDeltaEventArgs e)
+    {
+        double availableHeight =
+            PackageAreaRow.ActualHeight + OutputAreaRow.ActualHeight;
+        if (availableHeight <=
+            PackageAreaRow.MinHeight + OutputAreaRow.MinHeight)
+        {
+            return;
+        }
+
+        double packageHeight = Math.Clamp(
+            PackageAreaRow.ActualHeight + e.VerticalChange,
+            PackageAreaRow.MinHeight,
+            availableHeight - OutputAreaRow.MinHeight);
+
+        PackageAreaRow.Height = new GridLength(packageHeight);
+        OutputAreaRow.Height = new GridLength(availableHeight - packageHeight);
+    }
+
     private void Fail(string stage, string detail)
     {
         if (_currentDiagnostics is not null &&
@@ -2196,6 +2485,7 @@ public partial class MainWindow : Window
         string failedStage = _currentDiagnostics?.Run.Stages
             .FirstOrDefault(item => item.State == DiagnosticState.Failed)
             ?.Name ?? stage;
+        FailWorkflowRun(failedStage, detail);
         AppendOutput(
             $"{Environment.NewLine}✖ STOPPED AT {failedStage}: {detail}" +
             Environment.NewLine);
@@ -2223,34 +2513,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        bool hasTarget = _aiRequestContext is not null;
-        GeneratorOption selected = SelectedProvider;
-        bool hasInput = selected.Provider == GeneratorProvider.PasteJson
-            ? !string.IsNullOrWhiteSpace(ReturnedPackageBox?.Text)
-            : !string.IsNullOrWhiteSpace(DirectRequestBox?.Text);
-        bool configured = selected.Provider == GeneratorProvider.PasteJson;
-        if (!configured)
-        {
-            try
-            {
-                configured =
-                    _providerSettings.GetApiKeySource(selected.Provider) !=
-                    ProviderCredentialSource.None;
-            }
-            catch
-            {
-                configured = false;
-            }
-        }
-
-        RunButton.IsEnabled =
-            !_stopwatch.IsRunning && hasTarget && hasInput && configured;
+        RunButton.IsEnabled = !_stopwatch.IsRunning;
         if (CopyAiRequestButton is not null)
         {
-            CopyAiRequestButton.IsEnabled =
-                !_stopwatch.IsRunning &&
-                hasTarget &&
-                !string.IsNullOrWhiteSpace(DirectRequestBox?.Text);
+            CopyAiRequestButton.IsEnabled = !_stopwatch.IsRunning;
         }
         UpdateRetryAvailability();
     }
@@ -2582,6 +2848,105 @@ public partial class MainWindow : Window
             : ContextPreviewFormatter.Format(snapshot, selected);
         _projectMemory.SetRecentFiles(selected);
         RefreshSessionViews();
+    }
+
+    private void RefreshPackageValidationPreview()
+    {
+        if (ValidationReportText is null)
+        {
+            return;
+        }
+
+        string json = ReturnedPackageBox?.Text ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            ValidationReportText.Text =
+                "Paste or generate a package to see deterministic validation checks.";
+            return;
+        }
+
+        try
+        {
+            Package package = new PackageParser().Parse(json);
+            Models.ValidationResult validation = new PackageValidator().Validate(package);
+            PackagePreview? preview =
+                validation.IsValid && _projectState.CurrentState is not null
+                    ? new PackageExecutor().Preview(
+                        package,
+                        _projectState.CurrentState)
+                    : null;
+            ValidationReportText.Text =
+                PackageValidationReport.Build(package, validation, preview);
+        }
+        catch (FormatException exception)
+        {
+            ValidationReportText.Text =
+                PackageValidationReport.ParseFailure(exception.Message);
+        }
+    }
+
+    private void BeginProjectHealthBuild(AiRequestContext context)
+    {
+        if (string.Equals(
+                _healthBuildSolution,
+                context.Solution.Path,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _healthBuildSolution = context.Solution.Path;
+        int version = ++_healthBuildVersion;
+        _lastBuildHealth = "Checking in background…";
+        _sessionLog.Add(
+            $"Project health build started for {context.Target.Name}.");
+        RefreshPlanningPanels();
+        _ = CompleteProjectHealthBuildAsync(
+            context.Solution.Path,
+            context.Target.Name,
+            version);
+    }
+
+    private async Task CompleteProjectHealthBuildAsync(
+        string solutionPath,
+        string projectName,
+        int version)
+    {
+        BuildResult result;
+        try
+        {
+            result = await Task.Run(() =>
+                new SolutionBuilder().Build(solutionPath));
+        }
+        catch (Exception exception)
+        {
+            if (version != _healthBuildVersion)
+            {
+                return;
+            }
+
+            _lastBuildHealth = "Could not run — " + exception.Message;
+            _sessionLog.Add($"Project health build could not run: {exception.Message}");
+            RefreshPlanningPanels();
+            return;
+        }
+
+        if (version != _healthBuildVersion ||
+            !string.Equals(
+                SolutionPath.Text?.Trim(),
+                solutionPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _lastBuildHealth = result.Succeeded
+            ? "Succeeded on solution load"
+            : "Failed on solution load — see a normal run for full streamed output";
+        _sessionLog.Add(
+            $"Project health build for {projectName}: " +
+            (result.Succeeded ? "succeeded." : "failed."));
+        RefreshPlanningPanels();
     }
 
     private void RefreshSessionViews()

@@ -199,6 +199,7 @@ public static class FailedRunRetryPrompt
         prompt.AppendLine("Do not repeat operations that are already successful or already present.");
         prompt.AppendLine("Every oldText must be copied verbatim from the CURRENT PROJECT FILES supplied after this repair history.");
         prompt.AppendLine("Use the smallest exact unique oldText anchor that safely identifies the edit.");
+        prompt.AppendLine("Prefer insert_before or insert_after for localized additions. Do not introduce or remove unmatched XAML parent closing tags.");
         prompt.AppendLine("The latest CURRENT PROJECT FILES are authoritative and supersede stale text in prior packages.");
         prompt.AppendLine();
         prompt.AppendLine("ORIGINAL REQUESTED CHANGE:");

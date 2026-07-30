@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -20,10 +21,22 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Project context focuses on request-relevant source", TestFocusedProjectContextAsync),
     ("Web launch uses the target content root", TestWebLaunchContextAsync),
     ("Recovery state reports Git availability without mutation", TestRecoveryStateAsync),
+    ("Project health reports framework and generated exclusions", TestProjectHealthAsync),
+    ("Validation report explains exact replacement checks", TestValidationReportAsync),
+    ("Self-modification guard protects ParseTiger core files", TestSelfModificationGuardAsync),
+    ("Self-build writes outside the running output directory", TestStagedSelfBuildAsync),
+    ("Self-update handoff targets the normal executable", TestSelfUpdatePlanAsync),
+    ("Solution-dependent actions provide one clear reminder", TestSolutionSelectionReminderAsync),
+    ("Project memory retains focused session facts", TestProjectMemoryAsync),
     ("Gemini constructs, sends, and parses a request", TestGeminiSuccessAsync),
     ("Gemini classifies invalid credentials", TestGeminiInvalidKeyAsync),
     ("Gemini classifies malformed responses", TestGeminiMalformedResponseAsync),
     ("Manual package validates and applies", TestManualPackageAsync),
+    ("Localized insert operations preserve their anchor", TestLocalizedInsertAsync),
+    ("Localized XAML inserts require balanced content", TestUnbalancedXamlInsertAsync),
+    ("XAML parent-boundary replacement is rejected", TestXamlParentBoundaryAsync),
+    ("Malformed resulting XAML is rejected", TestMalformedResultingXamlAsync),
+    ("Disproportionately large XAML replacement is warned", TestLargeXamlScopeWarningAsync),
     ("Replace accepts unique normalized line endings", TestNormalizedLineEndingReplaceAsync),
     ("Failed replace reports exact diagnostics", TestFailedReplaceDiagnosticsAsync),
     ("Successful replace reports unique match", TestSuccessfulReplaceDiagnosticsAsync),
@@ -465,6 +478,211 @@ static Task TestManualPackageAsync()
         Assert(result.Succeeded, result.Message ?? "Manual apply failed.");
         Assert(File.ReadAllText(file) == "<Grid><Button /></Grid>",
             "Manual package produced the wrong file content.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task TestLocalizedInsertAsync()
+{
+    string root = CreateTemporaryProject(
+        "<Grid xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">" +
+        "<Button x:Name=\"SaveButton\" Content=\"Save\" /></Grid>");
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "insert_after",
+                    Path = "MainWindow.xaml",
+                    OldText = "<Button x:Name=\"SaveButton\" Content=\"Save\" />",
+                    NewText = "<Button Content=\"Cancel\" />"
+                }
+            ]
+        };
+
+        ValidationResult validation = new PackageValidator().Validate(package);
+        Assert(validation.IsValid, string.Join("; ", validation.Errors));
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        Assert(preview.CanApply, preview.Operations.Single().Error ??
+            "Localized insert did not pass preflight.");
+        ExecutionResult result = new PackageExecutor().Apply(package, root);
+        Assert(result.Succeeded, result.Message ?? "Localized insert failed.");
+        string content = File.ReadAllText(Path.Combine(root, "MainWindow.xaml"));
+        Assert(content.Contains(
+                "<Button x:Name=\"SaveButton\" Content=\"Save\" /><Button Content=\"Cancel\" />",
+                StringComparison.Ordinal),
+            "insert_after did not preserve the anchor before inserted content.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task TestXamlParentBoundaryAsync()
+{
+    string original =
+        "<Window xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\">" +
+        "<Grid><TextBlock Text=\"ParseTiger\" /></Grid></Window>";
+    string root = CreateTemporaryProject(original);
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "replace",
+                    Path = "MainWindow.xaml",
+                    OldText = "<TextBlock Text=\"ParseTiger\" />",
+                    NewText = "<TextBlock Text=\"ParseTiger\" /></Grid><Border />"
+                }
+            ]
+        };
+
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        Assert(!preview.CanApply,
+            "A child replacement that introduced </Grid> was accepted.");
+        Assert(preview.Operations.Single().Error?.Contains(
+                "parent closing tag </Grid>",
+                StringComparison.OrdinalIgnoreCase) == true,
+            "The unsafe parent-boundary diagnostic was not specific.");
+        ExecutionResult result = new PackageExecutor().Apply(package, root);
+        Assert(!result.Succeeded, "Unsafe XAML was applied.");
+        Assert(File.ReadAllText(Path.Combine(root, "MainWindow.xaml")) == original,
+            "The rejected XAML operation changed the file.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task TestUnbalancedXamlInsertAsync()
+{
+    string original = "<Grid><TextBlock /></Grid>";
+    string root = CreateTemporaryProject(original);
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "insert_before",
+                    Path = "MainWindow.xaml",
+                    OldText = "</Grid>",
+                    NewText = "</StackPanel>"
+                }
+            ]
+        };
+
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        Assert(!preview.CanApply,
+            "An insertion with an orphan XAML closing tag was accepted.");
+        Assert(preview.Operations.Single().Error?.Contains(
+                "unbalanced boundary",
+                StringComparison.OrdinalIgnoreCase) == true,
+            "The unbalanced insertion diagnostic was not specific.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task TestMalformedResultingXamlAsync()
+{
+    string original = "<Grid><TextBlock Text=\"Original\" /></Grid>";
+    string root = CreateTemporaryProject(original);
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "replace",
+                    Path = "MainWindow.xaml",
+                    OldText = "<TextBlock Text=\"Original\" />",
+                    NewText = "<TextBlock Text=\"One\" Text=\"Two\" />"
+                }
+            ]
+        };
+
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        Assert(!preview.CanApply, "Malformed resulting XAML was accepted.");
+        Assert(preview.Operations.Single().Error?.Contains(
+                "not well formed",
+                StringComparison.OrdinalIgnoreCase) == true,
+            "Malformed XAML did not receive a well-formedness diagnostic.");
+        Assert(File.ReadAllText(Path.Combine(root, "MainWindow.xaml")) == original,
+            "Preflight changed the source file.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    return Task.CompletedTask;
+}
+
+static Task TestLargeXamlScopeWarningAsync()
+{
+    string root = CreateTemporaryProject(
+        "<Grid><StackPanel x:Name=\"Target\" xmlns:x=" +
+        "\"http://schemas.microsoft.com/winfx/2006/xaml\" /></Grid>");
+    try
+    {
+        string controls = string.Join(
+            Environment.NewLine,
+            Enumerable.Range(1, 12).Select(index =>
+                $"<TextBlock Text=\"Item {index}\" />"));
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "replace",
+                    Path = "MainWindow.xaml",
+                    OldText = "<StackPanel x:Name=\"Target\" xmlns:x=" +
+                        "\"http://schemas.microsoft.com/winfx/2006/xaml\" />",
+                    NewText = "<StackPanel xmlns:x=" +
+                        "\"http://schemas.microsoft.com/winfx/2006/xaml\">" +
+                        Environment.NewLine + controls + Environment.NewLine +
+                        "</StackPanel>"
+                }
+            ]
+        };
+
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        Assert(preview.CanApply,
+            preview.Operations.Single().Error ?? "Balanced XAML should be applicable.");
+        Assert(preview.HasWarnings,
+            "A disproportionately large replacement did not produce a warning.");
     }
     finally
     {
@@ -916,8 +1134,10 @@ static Task TestRetryButtonPresentationAsync()
         RetryButtonPresentation.Unavailable("no failed run context.");
     Assert(unavailable.State == RetryButtonVisualState.Unavailable,
         "Unavailable retry state was not returned.");
-    Assert(unavailable.Opacity < 0.7,
-        "Unavailable retry state is not visibly faded.");
+    Assert(unavailable.Background == "#E8DDD2" &&
+           unavailable.Foreground == "#4A3A2C" &&
+           unavailable.Opacity == 1.0,
+        "Unavailable retry state is not readable in the Tiger theme.");
     Assert(unavailable.StatusText.Contains("unavailable", StringComparison.OrdinalIgnoreCase),
         "Unavailable retry state does not explain itself.");
 
@@ -936,8 +1156,8 @@ static Task TestRetryButtonPresentationAsync()
         RetryButtonPresentation.Available(context);
     Assert(available.State == RetryButtonVisualState.Available,
         "Available retry state was not returned.");
-    Assert(available.Background == "#D97706" && available.Opacity == 1.0,
-        "Available retry state is not strongly highlighted in amber.");
+    Assert(available.Background == "#C65D00" && available.Opacity == 1.0,
+        "Available retry state is not strongly highlighted in Tiger orange.");
     Assert(available.StatusText.Contains("3 errors", StringComparison.Ordinal),
         "Available retry status did not explain the previous build failure.");
 
@@ -1214,6 +1434,245 @@ static async Task TestMissingCountTextRetryAsync()
             Directory.Delete(root, recursive: true);
         }
     }
+}
+
+static Task TestProjectHealthAsync()
+{
+    string root = CreateTemporaryProject("<Grid />");
+    try
+    {
+        string projectFile = Path.Combine(root, "TEST.csproj");
+        File.WriteAllText(
+            projectFile,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>" +
+            "<TargetFramework>net10.0-windows</TargetFramework>" +
+            "</PropertyGroup></Project>");
+        Directory.CreateDirectory(Path.Combine(root, "bin"));
+        var solution = new SolutionInfo
+        {
+            Name = "TEST",
+            Path = Path.Combine(root, "TEST.slnx")
+        };
+        var project = new ProjectInfo
+        {
+            Name = "TEST",
+            Directory = root,
+            RelativePath = "TEST.csproj",
+            Kind = "WPF"
+        };
+
+        AiProjectFacts facts =
+            ProjectHealthInspector.Inspect(solution, project, projectFile);
+        string report = ProjectHealthInspector.Format(facts);
+        Assert(facts.TargetFramework == "net10.0-windows",
+            "Health check missed the target framework.");
+        Assert(facts.GeneratedFolders.Contains("bin"),
+            "Health check did not identify generated output.");
+        Assert(report.Contains("Generated folders excluded", StringComparison.Ordinal),
+            "Health report did not explain generated-folder handling.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestValidationReportAsync()
+{
+    string root = CreateTemporaryProject("<Grid />");
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "replace",
+                    Path = "MainWindow.xaml",
+                    OldText = "<Grid />",
+                    NewText = "<Grid><Button /></Grid>"
+                }
+            ]
+        };
+        ValidationResult validation = new PackageValidator().Validate(package);
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        string report = PackageValidationReport.Build(package, validation, preview);
+        Assert(report.Contains("JSON parsed", StringComparison.Ordinal) &&
+               report.Contains("one exact match", StringComparison.Ordinal),
+            "Detailed validation report omitted a successful exact-match check.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestSelfModificationGuardAsync()
+{
+    var project = new ProjectInfo
+    {
+        Name = "ParseTiger",
+        Directory = Path.Combine("C:", "work", "ParseTiger")
+    };
+    var package = new Package
+    {
+        Version = "1.0",
+        Operations =
+        [
+            new Operation
+            {
+                Type = "replace",
+                Path = "Validation/PackageValidator.cs",
+                OldText = "old",
+                NewText = "new"
+            }
+        ]
+    };
+    SelfModificationAssessment result =
+        SelfModificationGuard.Assess(project, package);
+    Assert(result.RequiresConfirmation && result.TouchesCoreSafetyCode,
+        "ParseTiger core self-modification was not protected.");
+    return Task.CompletedTask;
+}
+
+static async Task TestStagedSelfBuildAsync()
+{
+    string root = Path.Combine(
+        Path.GetTempPath(),
+        "ParseTiger.Tests.SelfBuild",
+        Guid.NewGuid().ToString("N"));
+    string staging = Path.Combine(root, "staging");
+    Directory.CreateDirectory(root);
+    string projectPath = Path.Combine(root, "SelfBuildFixture.csproj");
+    try
+    {
+        await File.WriteAllTextAsync(
+            projectPath,
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <OutputType>Exe</OutputType>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+            </Project>
+            """);
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Program.cs"),
+            """System.Console.WriteLine("staged");""");
+
+        BuildResult result = await Task.Run(() =>
+            new SolutionBuilder().Build(projectPath, baseOutputPath: staging));
+        Assert(result.Succeeded, result.Output);
+        Assert(
+            Directory.EnumerateFiles(
+                    staging,
+                    "SelfBuildFixture.dll",
+                    SearchOption.AllDirectories)
+                .Any(),
+            "The staged build did not produce its application assembly.");
+        Assert(!Directory.Exists(Path.Combine(root, "bin")),
+            "The staged build wrote into the normal project output directory.");
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static Task TestSelfUpdatePlanAsync()
+{
+    string root = Path.Combine(
+        Path.GetTempPath(),
+        "ParseTiger.Tests.SelfUpdate",
+        Guid.NewGuid().ToString("N"));
+    string stagedOutput = Path.Combine(root, "staging", "Debug", "net10.0-windows");
+    string destination = Path.Combine(root, "normal-output");
+    Directory.CreateDirectory(stagedOutput);
+    Directory.CreateDirectory(destination);
+    File.WriteAllText(Path.Combine(stagedOutput, "ParseTiger.exe"), "fixture");
+    try
+    {
+        SelfUpdatePlan plan = SelfUpdateCoordinator.Prepare(
+            Path.Combine(root, "staging"),
+            "ParseTiger",
+            Path.Combine(destination, "ParseTiger.exe"),
+            1234);
+        Assert(
+            plan.StagedOutputDirectory.Equals(
+                stagedOutput,
+                StringComparison.OrdinalIgnoreCase),
+            "The updater did not select the staged executable directory.");
+        Assert(
+            plan.DestinationOutputDirectory.Equals(
+                destination,
+                StringComparison.OrdinalIgnoreCase),
+            "The updater did not preserve the normal executable directory.");
+        Assert(plan.ExecutableName == "ParseTiger.exe" && plan.ProcessId == 1234,
+            "The updater handoff identity is incorrect.");
+
+        ProcessStartInfo startInfo = SelfUpdateCoordinator.CreateStartInfo(plan);
+        Assert(startInfo.FileName == "powershell.exe" &&
+               startInfo.ArgumentList.Contains(plan.ScriptPath) &&
+               startInfo.ArgumentList.Contains(plan.StagedOutputDirectory) &&
+               startInfo.ArgumentList.Contains(plan.DestinationOutputDirectory),
+            "The updater process omitted required handoff paths.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestSolutionSelectionReminderAsync()
+{
+    Assert(SolutionSelectionRequirement.IsMissing(null) &&
+           SolutionSelectionRequirement.IsMissing("   "),
+        "A missing solution was not detected.");
+    Assert(!SolutionSelectionRequirement.IsMissing(@"C:\work\App.slnx"),
+        "A selected solution was incorrectly rejected.");
+    Assert(
+        SolutionSelectionRequirement.Reminder.Contains(
+            "Browse",
+            StringComparison.Ordinal) &&
+        SolutionSelectionRequirement.Reminder.Contains(
+            "target solution",
+            StringComparison.OrdinalIgnoreCase),
+        "The solution reminder does not explain how to recover.");
+    return Task.CompletedTask;
+}
+
+static Task TestProjectMemoryAsync()
+{
+    var memory = new ProjectSessionMemory();
+    memory.Select(new AiProjectFacts(
+        "TEST.slnx",
+        "TEST",
+        "TEST.csproj",
+        "TEST",
+        "WPF",
+        "Microsoft.NET.Sdk",
+        "net10.0-windows",
+        false,
+        "Git unavailable",
+        2,
+        []));
+    memory.SetRequest("Add a Save button.");
+    memory.SetRecentFiles(["MainWindow.xaml", "MainWindow.xaml.cs"]);
+    memory.RecordSuccess(["MainWindow.xaml"]);
+    string report = memory.Format();
+    Assert(report.Contains("Add a Save button", StringComparison.Ordinal) &&
+           report.Contains("MainWindow.xaml", StringComparison.Ordinal) &&
+           report.Contains("Recent successful patches", StringComparison.Ordinal),
+        "Project memory omitted current-session facts.");
+    return Task.CompletedTask;
 }
 
 static string CreateTemporaryProject(string content)

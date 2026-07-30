@@ -12,12 +12,14 @@ namespace ParseTiger.Build;
 /// </summary>
 public sealed class SolutionBuilder
 {
-    public BuildResult Build(string solutionPath, IProgress<string>? progress = null)
+    public BuildResult Build(
+        string solutionPath,
+        IProgress<string>? progress = null,
+        string? baseOutputPath = null)
     {
         var startInfo = new ProcessStartInfo
         {
             FileName = "dotnet",
-            Arguments = $"build \"{solutionPath}\" --nologo -v m",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -25,6 +27,19 @@ public sealed class SolutionBuilder
             WorkingDirectory = Path.GetDirectoryName(solutionPath) ??
                 Environment.CurrentDirectory
         };
+        startInfo.ArgumentList.Add("build");
+        startInfo.ArgumentList.Add(solutionPath);
+        startInfo.ArgumentList.Add("--nologo");
+        startInfo.ArgumentList.Add("-v");
+        startInfo.ArgumentList.Add("m");
+        if (!string.IsNullOrWhiteSpace(baseOutputPath))
+        {
+            string outputRoot =
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(baseOutputPath)) +
+                Path.DirectorySeparatorChar;
+            Directory.CreateDirectory(outputRoot);
+            startInfo.ArgumentList.Add($"-p:BaseOutputPath={outputRoot}");
+        }
 
         var output = new StringBuilder();
         using var process = new Process { StartInfo = startInfo };

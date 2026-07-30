@@ -1,6 +1,7 @@
 using System.IO;
 using ParseTiger.Models;
 using ParseTiger.State;
+using ParseTiger.Validation;
 
 namespace ParseTiger.Execution;
 
@@ -74,44 +75,77 @@ public sealed class PackageExecutor
             };
         }
 
-        int applied = 0;
-        foreach (Operation operation in package.Operations)
+        var originals = new Dictionary<string, byte[]>(
+            StringComparer.OrdinalIgnoreCase);
+        var updated = new Dictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < package.Operations.Count; index++)
         {
+            Operation operation = package.Operations[index];
             string fullPath = ResolveInside(projectFolder, operation.Path!);
-            string content = File.ReadAllText(fullPath);
+            string relative = NormalizeRelative(operation.Path!);
+            if (!originals.TryGetValue(relative, out byte[]? originalBytes))
+            {
+                originalBytes = File.ReadAllBytes(fullPath);
+                originals[relative] = originalBytes;
+            }
+
+            string content = updated.TryGetValue(relative, out string? prior)
+                ? prior
+                : DecodeText(originalBytes);
             string oldText = operation.OldText ?? string.Empty;
             TextMatch match = FindUniqueMatch(content, oldText);
 
-            // Re-check uniqueness at write time in case the file changed.
             if (!match.IsUnique)
             {
-                return new ExecutionResult
-                {
-                    Succeeded = false,
-                    Message = $"Aborted at \"{operation.Path}\": the old text is no " +
-                        $"longer a unique match. {applied} change(s) were already written.",
-                    FailedOperationNumber = applied + 1,
-                    FailedPath = operation.Path,
-                    MatchCount = match.Count,
-                    ExpectedOldText = oldText,
-                    NearbyExcerpt = FindNearbyExcerpt(content, oldText)
-                };
+                return Failed(
+                    index + 1,
+                    operation,
+                    match.Count,
+                    $"Nothing was applied. The anchor in \"{operation.Path}\" " +
+                    "is no longer a unique match.",
+                    FindNearbyExcerpt(content, oldText));
             }
 
-            string replacement = AdaptNewLines(
-                operation.NewText ?? string.Empty,
-                content);
-            string updated = content[..match.Start] +
-                replacement +
-                content[match.End..];
-            File.WriteAllText(fullPath, updated);
-            applied++;
+            updated[relative] = BuildUpdatedContent(operation, content, match);
+        }
+
+        ExecutionResult? safetyFailure =
+            ValidateStagedXaml(package, updated);
+        if (safetyFailure is not null)
+        {
+            return safetyFailure;
+        }
+
+        // Confirm every source file is unchanged, then write the staged set.
+        foreach ((string relative, byte[] originalBytes) in originals)
+        {
+            string fullPath = ResolveInside(projectFolder, relative);
+            if (!File.Exists(fullPath) ||
+                !File.ReadAllBytes(fullPath).SequenceEqual(originalBytes))
+            {
+                Operation operation = package.Operations.First(item =>
+                    NormalizeRelative(item.Path!).Equals(
+                        relative,
+                        StringComparison.OrdinalIgnoreCase));
+                return Failed(
+                    package.Operations.IndexOf(operation) + 1,
+                    operation,
+                    0,
+                    "A target file changed during preflight. Nothing was applied.",
+                    string.Empty);
+            }
+        }
+
+        foreach ((string relative, string content) in updated)
+        {
+            File.WriteAllText(ResolveInside(projectFolder, relative), content);
         }
 
         return new ExecutionResult
         {
             Succeeded = true,
-            Message = $"Applied {applied} operation(s) successfully."
+            Message = $"Applied {package.Operations.Count} operation(s) successfully."
         };
     }
 
@@ -170,12 +204,14 @@ public sealed class PackageExecutor
                     FindNearbyExcerpt(content, oldText));
             }
 
-            string replacement = AdaptNewLines(
-                operation.NewText ?? string.Empty,
-                content);
-            updated[relative] = content[..match.Start] +
-                replacement +
-                content[match.End..];
+            updated[relative] = BuildUpdatedContent(operation, content, match);
+        }
+
+        ExecutionResult? safetyFailure =
+            ValidateStagedXaml(package, updated);
+        if (safetyFailure is not null)
+        {
+            return safetyFailure;
         }
 
         // Recheck the exact bytes supplied to the AI before any write occurs.
@@ -270,9 +306,7 @@ public sealed class PackageExecutor
             return result;
         }
 
-        result.Before = oldText;
-        result.After = operation.NewText ?? string.Empty;
-        result.Applicable = true;
+        CompletePreview(operation, content, match, result);
         return result;
     }
 
@@ -322,9 +356,71 @@ public sealed class PackageExecutor
             return result;
         }
 
+        CompletePreview(operation, content, match, result);
+        return result;
+    }
+
+    private static void CompletePreview(
+        Operation operation,
+        string content,
+        TextMatch match,
+        OperationPreview result)
+    {
+        result.Before = operation.OldText ?? string.Empty;
         result.After = operation.NewText ?? string.Empty;
         result.Applicable = true;
-        return result;
+        string updated = BuildUpdatedContent(operation, content, match);
+        XamlChangeSafety.AssessOperation(operation, updated, result);
+    }
+
+    private static string BuildUpdatedContent(
+        Operation operation,
+        string content,
+        TextMatch match)
+    {
+        string newText = AdaptNewLines(
+            operation.NewText ?? string.Empty,
+            content);
+        string matchedText = content[match.Start..match.End];
+        string replacement = operation.Type?.Trim().ToLowerInvariant() switch
+        {
+            "insert_before" => newText + matchedText,
+            "insert_after" => matchedText + newText,
+            _ => newText
+        };
+        return content[..match.Start] + replacement + content[match.End..];
+    }
+
+    private static ExecutionResult? ValidateStagedXaml(
+        Package package,
+        IReadOnlyDictionary<string, string> updated)
+    {
+        foreach ((string relative, string content) in updated)
+        {
+            if (!XamlChangeSafety.IsXaml(relative))
+            {
+                continue;
+            }
+
+            string? error = XamlChangeSafety.ValidateDocument(content);
+            if (error is null)
+            {
+                continue;
+            }
+
+            Operation operation = package.Operations.First(item =>
+                NormalizeRelative(item.Path!).Equals(
+                    relative,
+                    StringComparison.OrdinalIgnoreCase));
+            return Failed(
+                package.Operations.IndexOf(operation) + 1,
+                operation,
+                1,
+                "Nothing was applied. " + error,
+                string.Empty);
+        }
+
+        return null;
     }
 
     private static ExecutionResult Failed(

@@ -22,9 +22,9 @@ public sealed record RetryButtonPresentation(
             RetryButtonVisualState.Unavailable,
             "Retry Failed Run",
             $"Retry unavailable: {reason}",
-            "#E5E7EB",
-            "#6B7280",
-            0.62);
+            "#E8DDD2",
+            "#4A3A2C",
+            1.0);
 
     public static RetryButtonPresentation Available(FailedRunRetryContext context)
     {
@@ -44,7 +44,7 @@ public sealed record RetryButtonPresentation(
             RetryButtonVisualState.Available,
             "Retry Failed Run",
             $"Retry available: {reason}",
-            "#D97706",
+            "#C65D00",
             "#FFFFFF",
             1.0);
     }
@@ -54,7 +54,7 @@ public sealed record RetryButtonPresentation(
             RetryButtonVisualState.Running,
             "Retrying Failed Run...",
             "Retry in progress: repairing the previous failed run.",
-            "#B45309",
+            "#9A4700",
             "#FFFFFF",
             0.9);
 
