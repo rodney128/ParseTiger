@@ -34,6 +34,15 @@ public sealed class BaselineService
     public bool Exists(string projectFolder) =>
         File.Exists(Path.Combine(GetProjectStoragePath(projectFolder), ManifestFileName));
 
+    public void Delete(string projectFolder)
+    {
+        string destination = GetProjectStoragePath(Path.GetFullPath(projectFolder));
+        if (Directory.Exists(destination))
+        {
+            Directory.Delete(destination, recursive: true);
+        }
+    }
+
     public ProjectBaselineInfo? GetInfo(string projectFolder)
     {
         string manifestPath = Path.Combine(

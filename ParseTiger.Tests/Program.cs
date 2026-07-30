@@ -20,6 +20,10 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Project context focuses on request-relevant source", TestFocusedProjectContextAsync),
     ("Web launch uses the target content root", TestWebLaunchContextAsync),
     ("Recovery state reports Git availability without mutation", TestRecoveryStateAsync),
+    ("Project health reports framework and generated exclusions", TestProjectHealthAsync),
+    ("Validation report explains exact replacement checks", TestValidationReportAsync),
+    ("Self-modification guard protects ParseTiger core files", TestSelfModificationGuardAsync),
+    ("Project memory retains focused session facts", TestProjectMemoryAsync),
     ("Gemini constructs, sends, and parses a request", TestGeminiSuccessAsync),
     ("Gemini classifies invalid credentials", TestGeminiInvalidKeyAsync),
     ("Gemini classifies malformed responses", TestGeminiMalformedResponseAsync),
@@ -1214,6 +1218,135 @@ static async Task TestMissingCountTextRetryAsync()
             Directory.Delete(root, recursive: true);
         }
     }
+}
+
+static Task TestProjectHealthAsync()
+{
+    string root = CreateTemporaryProject("<Grid />");
+    try
+    {
+        string projectFile = Path.Combine(root, "TEST.csproj");
+        File.WriteAllText(
+            projectFile,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>" +
+            "<TargetFramework>net10.0-windows</TargetFramework>" +
+            "</PropertyGroup></Project>");
+        Directory.CreateDirectory(Path.Combine(root, "bin"));
+        var solution = new SolutionInfo
+        {
+            Name = "TEST",
+            Path = Path.Combine(root, "TEST.slnx")
+        };
+        var project = new ProjectInfo
+        {
+            Name = "TEST",
+            Directory = root,
+            RelativePath = "TEST.csproj",
+            Kind = "WPF"
+        };
+
+        AiProjectFacts facts =
+            ProjectHealthInspector.Inspect(solution, project, projectFile);
+        string report = ProjectHealthInspector.Format(facts);
+        Assert(facts.TargetFramework == "net10.0-windows",
+            "Health check missed the target framework.");
+        Assert(facts.GeneratedFolders.Contains("bin"),
+            "Health check did not identify generated output.");
+        Assert(report.Contains("Generated folders excluded", StringComparison.Ordinal),
+            "Health report did not explain generated-folder handling.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestValidationReportAsync()
+{
+    string root = CreateTemporaryProject("<Grid />");
+    try
+    {
+        var package = new Package
+        {
+            Version = "1.0",
+            Operations =
+            [
+                new Operation
+                {
+                    Type = "replace",
+                    Path = "MainWindow.xaml",
+                    OldText = "<Grid />",
+                    NewText = "<Grid><Button /></Grid>"
+                }
+            ]
+        };
+        ValidationResult validation = new PackageValidator().Validate(package);
+        PackagePreview preview = new PackageExecutor().Preview(package, root);
+        string report = PackageValidationReport.Build(package, validation, preview);
+        Assert(report.Contains("JSON parsed", StringComparison.Ordinal) &&
+               report.Contains("one exact match", StringComparison.Ordinal),
+            "Detailed validation report omitted a successful exact-match check.");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    return Task.CompletedTask;
+}
+
+static Task TestSelfModificationGuardAsync()
+{
+    var project = new ProjectInfo
+    {
+        Name = "ParseTiger",
+        Directory = Path.Combine("C:", "work", "ParseTiger")
+    };
+    var package = new Package
+    {
+        Version = "1.0",
+        Operations =
+        [
+            new Operation
+            {
+                Type = "replace",
+                Path = "Validation/PackageValidator.cs",
+                OldText = "old",
+                NewText = "new"
+            }
+        ]
+    };
+    SelfModificationAssessment result =
+        SelfModificationGuard.Assess(project, package);
+    Assert(result.RequiresConfirmation && result.TouchesCoreSafetyCode,
+        "ParseTiger core self-modification was not protected.");
+    return Task.CompletedTask;
+}
+
+static Task TestProjectMemoryAsync()
+{
+    var memory = new ProjectSessionMemory();
+    memory.Select(new AiProjectFacts(
+        "TEST.slnx",
+        "TEST",
+        "TEST.csproj",
+        "TEST",
+        "WPF",
+        "Microsoft.NET.Sdk",
+        "net10.0-windows",
+        false,
+        "Git unavailable",
+        2,
+        []));
+    memory.SetRequest("Add a Save button.");
+    memory.SetRecentFiles(["MainWindow.xaml", "MainWindow.xaml.cs"]);
+    memory.RecordSuccess(["MainWindow.xaml"]);
+    string report = memory.Format();
+    Assert(report.Contains("Add a Save button", StringComparison.Ordinal) &&
+           report.Contains("MainWindow.xaml", StringComparison.Ordinal) &&
+           report.Contains("Recent successful patches", StringComparison.Ordinal),
+        "Project memory omitted current-session facts.");
+    return Task.CompletedTask;
 }
 
 static string CreateTemporaryProject(string content)

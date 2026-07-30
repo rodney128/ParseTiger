@@ -36,6 +36,10 @@ public partial class MainWindow : Window
     private readonly Stopwatch _stopwatch = new();
     private readonly DispatcherTimer _timer;
     private readonly BaselineService _baselineService = new();
+    private readonly BaselineService _checkpointService = new(Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ParseTiger",
+        "Checkpoints"));
     private readonly ProjectStateService _projectState = new();
     private readonly ProjectDefaultTemplateService _defaultTemplateService = new();
     private readonly IProviderSettingsStore _providerSettings =
@@ -63,6 +67,8 @@ public partial class MainWindow : Window
     private bool _isRetryRunning;
     private AiProjectFacts? _projectFacts;
     private string _lastBuildHealth = "Not run this session";
+    private string _healthBuildSolution = string.Empty;
+    private int _healthBuildVersion;
 
     public MainWindow()
     {
@@ -700,6 +706,7 @@ public partial class MainWindow : Window
                 _lastBackup = runContext.ToBackup();
                 mutationStarted = true;
             }
+            _checkpointService.Save(target.Directory, target.Kind);
             _currentDiagnostics.Succeed(
                 "backup",
                 $"Captured {_lastBackup!.Files.Count:N0} files.");
@@ -1142,6 +1149,7 @@ public partial class MainWindow : Window
         }
 
         UpdateActionAvailability();
+        RefreshPackageValidationPreview();
     }
 
     private void DirectRequestBox_TextChanged(
@@ -1251,6 +1259,13 @@ public partial class MainWindow : Window
                 SourceExtensions,
                 DirectRequestBox.Text);
             _projectMemory.SetRecentFiles(planningFiles);
+            if ((_lastBackup is null || !_lastBackup.HasFiles) &&
+                _checkpointService.Exists(context.Target.Directory))
+            {
+                _lastBackup = _checkpointService.Load(context.Target.Directory);
+                _sessionLog.Add(
+                    "Loaded the durable pre-apply recovery checkpoint for Undo.");
+            }
             if (previousStateId != context.Snapshot.Id)
             {
                 AppendOutput(
@@ -1267,6 +1282,7 @@ public partial class MainWindow : Window
             UpdateActionAvailability();
             UpdateReadyStatus();
             RefreshPlanningPanels();
+            BeginProjectHealthBuild(context);
             return;
         }
 
@@ -1395,6 +1411,11 @@ public partial class MainWindow : Window
         try
         {
             BackupService.Restore(_lastBackup);
+            if (TryResolveSelectedProject(out _, out ProjectInfo? undoTarget) &&
+                undoTarget is not null)
+            {
+                _checkpointService.Delete(undoTarget.Directory);
+            }
             RefreshCurrentStateAfterLocalChange("Undo");
             AppendOutput($"{Environment.NewLine}↩ Reverted the last change.{Environment.NewLine}");
             StatusText.Text = "Reverted the last change. Run again to rebuild.";
@@ -1564,6 +1585,7 @@ public partial class MainWindow : Window
 
         try
         {
+            _checkpointService.Save(target.Directory, target.Kind);
             resetAction();
             bool projectBaselineReset = successMessage.Contains(
                 "saved project baseline",
@@ -2071,6 +2093,11 @@ public partial class MainWindow : Window
 
             if (restored)
             {
+                string? projectRoot = _projectState.CurrentState?.Identity.ProjectRoot;
+                if (!string.IsNullOrWhiteSpace(projectRoot))
+                {
+                    _checkpointService.Delete(projectRoot);
+                }
                 _lastBackup = null;
             }
             else
@@ -2582,6 +2609,105 @@ public partial class MainWindow : Window
             : ContextPreviewFormatter.Format(snapshot, selected);
         _projectMemory.SetRecentFiles(selected);
         RefreshSessionViews();
+    }
+
+    private void RefreshPackageValidationPreview()
+    {
+        if (ValidationReportText is null)
+        {
+            return;
+        }
+
+        string json = ReturnedPackageBox?.Text ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            ValidationReportText.Text =
+                "Paste or generate a package to see deterministic validation checks.";
+            return;
+        }
+
+        try
+        {
+            Package package = new PackageParser().Parse(json);
+            Models.ValidationResult validation = new PackageValidator().Validate(package);
+            PackagePreview? preview =
+                validation.IsValid && _projectState.CurrentState is not null
+                    ? new PackageExecutor().Preview(
+                        package,
+                        _projectState.CurrentState)
+                    : null;
+            ValidationReportText.Text =
+                PackageValidationReport.Build(package, validation, preview);
+        }
+        catch (FormatException exception)
+        {
+            ValidationReportText.Text =
+                PackageValidationReport.ParseFailure(exception.Message);
+        }
+    }
+
+    private void BeginProjectHealthBuild(AiRequestContext context)
+    {
+        if (string.Equals(
+                _healthBuildSolution,
+                context.Solution.Path,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _healthBuildSolution = context.Solution.Path;
+        int version = ++_healthBuildVersion;
+        _lastBuildHealth = "Checking in background…";
+        _sessionLog.Add(
+            $"Project health build started for {context.Target.Name}.");
+        RefreshPlanningPanels();
+        _ = CompleteProjectHealthBuildAsync(
+            context.Solution.Path,
+            context.Target.Name,
+            version);
+    }
+
+    private async Task CompleteProjectHealthBuildAsync(
+        string solutionPath,
+        string projectName,
+        int version)
+    {
+        BuildResult result;
+        try
+        {
+            result = await Task.Run(() =>
+                new SolutionBuilder().Build(solutionPath));
+        }
+        catch (Exception exception)
+        {
+            if (version != _healthBuildVersion)
+            {
+                return;
+            }
+
+            _lastBuildHealth = "Could not run — " + exception.Message;
+            _sessionLog.Add($"Project health build could not run: {exception.Message}");
+            RefreshPlanningPanels();
+            return;
+        }
+
+        if (version != _healthBuildVersion ||
+            !string.Equals(
+                SolutionPath.Text?.Trim(),
+                solutionPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _lastBuildHealth = result.Succeeded
+            ? "Succeeded on solution load"
+            : "Failed on solution load — see a normal run for full streamed output";
+        _sessionLog.Add(
+            $"Project health build for {projectName}: " +
+            (result.Succeeded ? "succeeded." : "failed."));
+        RefreshPlanningPanels();
     }
 
     private void RefreshSessionViews()
