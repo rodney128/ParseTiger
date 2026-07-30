@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
@@ -10,21 +11,36 @@ namespace ParseTiger;
 
 public partial class MainWindow
 {
+    private Button? _runProjectButton;
     private Button? _buildProjectButton;
-    private bool _standaloneBuildRunning;
+    private bool _standaloneActionRunning;
 
     protected override void OnInitialized(EventArgs e)
     {
         base.OnInitialized(e);
-        AddBuildProjectButton();
+        AddStandaloneProjectButtons();
     }
 
-    private void AddBuildProjectButton()
+    private void AddStandaloneProjectButtons()
     {
-        if (_buildProjectButton is not null || RunButton?.Parent is not Panel actions)
+        if ((_runProjectButton is not null || _buildProjectButton is not null) ||
+            RunButton?.Parent is not Panel actions)
         {
             return;
         }
+
+        _runProjectButton = new Button
+        {
+            Name = "RunProjectButton",
+            Content = "Run",
+            MinWidth = 90,
+            Height = 38,
+            Padding = new Thickness(14, 0, 14, 0),
+            Margin = new Thickness(0, 0, 8, 0),
+            FontWeight = FontWeights.SemiBold,
+            ToolTip = "Launch the selected project as it exists now, without generating or applying an AI package."
+        };
+        _runProjectButton.Click += RunProject_Click;
 
         _buildProjectButton = new Button
         {
@@ -39,13 +55,82 @@ public partial class MainWindow
         };
         _buildProjectButton.Click += BuildProject_Click;
 
-        int runIndex = actions.Children.IndexOf(RunButton);
-        actions.Children.Insert(Math.Max(0, runIndex), _buildProjectButton);
+        int generateIndex = actions.Children.IndexOf(RunButton);
+        int insertionIndex = Math.Max(0, generateIndex);
+        actions.Children.Insert(insertionIndex, _runProjectButton);
+        actions.Children.Insert(insertionIndex + 1, _buildProjectButton);
+    }
+
+    private async void RunProject_Click(object sender, RoutedEventArgs e)
+    {
+        if (_standaloneActionRunning)
+        {
+            return;
+        }
+
+        if (!TryResolveSelectedProject(out _, out ProjectInfo? target) || target is null)
+        {
+            return;
+        }
+
+        _standaloneActionRunning = true;
+        SetStandaloneControlsEnabled(false, "Running...");
+        Busy.Visibility = Visibility.Visible;
+        WorkflowTabs.SelectedIndex = 0;
+        BuildOutput.Clear();
+        ResetWorkflowActivity();
+
+        string targetName = target.Name;
+        SetStage("Running project...", $"Launching {targetName} without applying an AI package.");
+        BeginWorkflowActivity("Standalone run", $"Launching {targetName}.");
+
+        try
+        {
+            if (IsAndroidTarget(target))
+            {
+                string projectPath = ResolveProjectPath(target);
+                AppendOutput($"▶ dotnet build \"{projectPath}\" -t:Run --nologo -v m{Environment.NewLine}");
+                int exitCode = await RunDotnetTargetAsync(projectPath, "Run");
+                if (exitCode != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Android deployment/run returned exit code {exitCode}. See Output for details.");
+                }
+            }
+            else
+            {
+                AppendOutput($"▶ Launching existing build output for {targetName}.{Environment.NewLine}");
+                new AppLauncher().Launch(target.Directory, targetName);
+            }
+
+            string summary = $"Launched {targetName}. No source files were changed.";
+            AppendOutput($"{Environment.NewLine}✓ {summary}{Environment.NewLine}");
+            CompleteWorkflowActivity("Standalone run", summary);
+            SetStage("Run started", summary);
+        }
+        catch (FileNotFoundException exception)
+        {
+            ShowStandaloneFailure(
+                "Run could not start",
+                exception.Message + " Build the project first, then try Run again.",
+                "Standalone run");
+        }
+        catch (Exception exception)
+        {
+            ShowStandaloneFailure("Run failed", exception.Message, "Standalone run");
+        }
+        finally
+        {
+            Busy.Visibility = Visibility.Collapsed;
+            _standaloneActionRunning = false;
+            SetStandaloneControlsEnabled(true);
+            UpdateActionAvailability();
+        }
     }
 
     private async void BuildProject_Click(object sender, RoutedEventArgs e)
     {
-        if (_standaloneBuildRunning)
+        if (_standaloneActionRunning)
         {
             return;
         }
@@ -60,9 +145,10 @@ public partial class MainWindow
         targetPath = Path.GetFullPath(targetPath);
         if (!File.Exists(targetPath))
         {
-            ShowStandaloneBuildFailure(
+            ShowStandaloneFailure(
                 "Build could not start",
-                $"The selected file does not exist: {targetPath}");
+                $"The selected file does not exist: {targetPath}",
+                "Standalone build");
             return;
         }
 
@@ -71,14 +157,15 @@ public partial class MainWindow
             !extension.Equals(".slnx", StringComparison.OrdinalIgnoreCase) &&
             !extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
         {
-            ShowStandaloneBuildFailure(
+            ShowStandaloneFailure(
                 "Build could not start",
-                "Select a .sln, .slnx, or .csproj file.");
+                "Select a .sln, .slnx, or .csproj file.",
+                "Standalone build");
             return;
         }
 
-        _standaloneBuildRunning = true;
-        SetStandaloneBuildControlsEnabled(false);
+        _standaloneActionRunning = true;
+        SetStandaloneControlsEnabled(false, "Building...");
         Busy.Visibility = Visibility.Visible;
         WorkflowTabs.SelectedIndex = 0;
         BuildOutput.Clear();
@@ -101,8 +188,8 @@ public partial class MainWindow
             (int warnings, int errors) = ReadBuildCounts(result.Output);
             string outcome = result.Succeeded ? "Build succeeded" : "Build failed";
             string summary =
-                $"{outcome}. {errors:N0} error(s), {warnings:N0} warning(s), " +
-                $"duration {elapsed.Elapsed:mm\\:ss}.";
+                $"{outcome} for {displayName}. {errors:N0} error(s), " +
+                $"{warnings:N0} warning(s), duration {elapsed.Elapsed:mm\\:ss}.";
 
             AppendOutput(Environment.NewLine + summary + Environment.NewLine);
             _lastBuildHealth = result.Succeeded ? "Succeeded" : "Failed — see Output";
@@ -125,28 +212,99 @@ public partial class MainWindow
             string detail = exception.NativeErrorCode == 2
                 ? "The dotnet command was not found. Install or repair the .NET SDK and try again."
                 : $"The build process could not start: {exception.Message}";
-            ShowStandaloneBuildFailure("Build could not start", detail);
+            ShowStandaloneFailure("Build could not start", detail, "Standalone build");
         }
         catch (Exception exception)
         {
             elapsed.Stop();
-            ShowStandaloneBuildFailure("Build could not start", exception.Message);
+            ShowStandaloneFailure("Build could not start", exception.Message, "Standalone build");
         }
         finally
         {
             Busy.Visibility = Visibility.Collapsed;
-            _standaloneBuildRunning = false;
-            SetStandaloneBuildControlsEnabled(true);
+            _standaloneActionRunning = false;
+            SetStandaloneControlsEnabled(true);
             UpdateActionAvailability();
         }
     }
 
-    private void SetStandaloneBuildControlsEnabled(bool enabled)
+    private async Task<int> RunDotnetTargetAsync(string projectPath, string target)
     {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(projectPath) ?? Environment.CurrentDirectory
+        };
+        startInfo.ArgumentList.Add("build");
+        startInfo.ArgumentList.Add(projectPath);
+        startInfo.ArgumentList.Add($"-t:{target}");
+        startInfo.ArgumentList.Add("--nologo");
+        startInfo.ArgumentList.Add("-v");
+        startInfo.ArgumentList.Add("m");
+
+        using var process = new Process { StartInfo = startInfo };
+        process.OutputDataReceived += (_, eventArgs) =>
+        {
+            if (eventArgs.Data is not null)
+            {
+                Dispatcher.Invoke(() => AppendOutput(eventArgs.Data + Environment.NewLine));
+            }
+        };
+        process.ErrorDataReceived += (_, eventArgs) =>
+        {
+            if (eventArgs.Data is not null)
+            {
+                Dispatcher.Invoke(() => AppendOutput(eventArgs.Data + Environment.NewLine));
+            }
+        };
+
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Windows did not start the dotnet run process.");
+        }
+
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        await process.WaitForExitAsync();
+        return process.ExitCode;
+    }
+
+    private static bool IsAndroidTarget(ProjectInfo target) =>
+        target.Kind.Contains("Android", StringComparison.OrdinalIgnoreCase) ||
+        target.Kind.Contains("MAUI", StringComparison.OrdinalIgnoreCase) ||
+        target.RelativePath.Contains("Android", StringComparison.OrdinalIgnoreCase);
+
+    private static string ResolveProjectPath(ProjectInfo target)
+    {
+        string projectPath = Path.IsPathRooted(target.RelativePath)
+            ? target.RelativePath
+            : Path.Combine(target.Directory, target.RelativePath);
+        projectPath = Path.GetFullPath(projectPath);
+        if (!File.Exists(projectPath))
+        {
+            throw new FileNotFoundException(
+                $"The selected project file was not found: {projectPath}");
+        }
+
+        return projectPath;
+    }
+
+    private void SetStandaloneControlsEnabled(bool enabled, string? busyLabel = null)
+    {
+        if (_runProjectButton is not null)
+        {
+            _runProjectButton.IsEnabled = enabled;
+            _runProjectButton.Content = enabled ? "Run" : busyLabel ?? "Working...";
+        }
+
         if (_buildProjectButton is not null)
         {
             _buildProjectButton.IsEnabled = enabled;
-            _buildProjectButton.Content = enabled ? "Build Project" : "Building...";
+            _buildProjectButton.Content = enabled ? "Build Project" : "Build Project";
         }
 
         BrowseButton.IsEnabled = enabled;
@@ -155,10 +313,10 @@ public partial class MainWindow
         RetryButton.IsEnabled = enabled && _lastFailedRun is not null;
     }
 
-    private void ShowStandaloneBuildFailure(string stage, string detail)
+    private void ShowStandaloneFailure(string stage, string detail, string activity)
     {
         AppendOutput($"{Environment.NewLine}✖ {stage}: {detail}{Environment.NewLine}");
-        FailWorkflowActivity("Standalone build", detail);
+        FailWorkflowActivity(activity, detail);
         SetStage(stage, detail);
     }
 
