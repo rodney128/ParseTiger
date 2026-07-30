@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ParseTiger/ParseTiger.csproj" />
+  <Project Path="ParseTiger.Tests/ParseTiger.Tests.csproj" />
+</Solution>

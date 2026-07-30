@@ -1,0 +1,96 @@
+<Window x:Class="ParseTiger.ProviderSettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AI Provider Settings" Height="520" Width="720"
+        MinHeight="480" MinWidth="640"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock FontSize="21" FontWeight="SemiBold" Text="AI Provider Settings" />
+        <TextBlock Grid.Row="1" Margin="0,5,0,14" Foreground="#555555"
+                   TextWrapping="Wrap"
+                   Text="API keys are stored in Windows Credential Manager for this Windows user. Saved keys are never displayed or written into ParseTiger, project, appsettings, or JSON files." />
+
+        <GroupBox Grid.Row="2" Header="Gemini" Margin="0,0,0,12" Padding="12">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Status:" VerticalAlignment="Center" />
+                <TextBlock x:Name="GeminiStatus" Grid.Column="1" Margin="8,0,12,0"
+                           FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Button x:Name="GeminiAddChangeButton" Grid.Column="2"
+                        Padding="12,4" Margin="0,0,8,0"
+                        Tag="Gemini" Click="AddOrChangeKey_Click" />
+                <Button x:Name="GeminiRemoveButton" Grid.Column="3"
+                        Content="Remove API Key" Padding="12,4"
+                        Tag="Gemini" Click="RemoveKey_Click" />
+
+                <TextBlock Grid.Row="1" Text="Model:" VerticalAlignment="Center"
+                           Margin="0,10,0,0" />
+                <ComboBox x:Name="GeminiModel" Grid.Row="1" Grid.Column="1"
+                          Grid.ColumnSpan="3" Margin="8,10,0,0" Padding="5"
+                          IsEditable="True" />
+            </Grid>
+        </GroupBox>
+
+        <GroupBox Grid.Row="3" Header="OpenAI" Margin="0,0,0,12" Padding="12">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Status:" VerticalAlignment="Center" />
+                <TextBlock x:Name="OpenAiStatus" Grid.Column="1" Margin="8,0,12,0"
+                           FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Button x:Name="OpenAiAddChangeButton" Grid.Column="2"
+                        Padding="12,4" Margin="0,0,8,0"
+                        Tag="OpenAI" Click="AddOrChangeKey_Click" />
+                <Button x:Name="OpenAiRemoveButton" Grid.Column="3"
+                        Content="Remove API Key" Padding="12,4"
+                        Tag="OpenAI" Click="RemoveKey_Click" />
+
+                <TextBlock Grid.Row="1" Text="Model:" VerticalAlignment="Center"
+                           Margin="0,10,0,0" />
+                <ComboBox x:Name="OpenAiModel" Grid.Row="1" Grid.Column="1"
+                          Grid.ColumnSpan="3" Margin="8,10,0,0" Padding="5"
+                          IsEditable="True" />
+            </Grid>
+        </GroupBox>
+
+        <Border Grid.Row="4" Background="#F5F5F5" BorderBrush="#D8D8D8"
+                BorderThickness="1" CornerRadius="3" Padding="10">
+            <TextBlock x:Name="Feedback" TextWrapping="Wrap"
+                       Text="Add or change a provider key, then close this window when finished." />
+        </Border>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,14,0,0">
+            <Button Content="Save Models" Width="110" Margin="0,0,8,0"
+                    Click="SaveModels_Click" />
+            <Button Content="Close" Width="90" IsCancel="True" />
+        </StackPanel>
+    </Grid>
+</Window>
